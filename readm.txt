@@ -1,0 +1,303 @@
+<?php
+
+namespace App\Controllers\Api;
+
+use App\Models\UserLog;
+use CodeIgniter\RESTful\ResourceController;
+use CodeIgniter\API\ResponseTrait;
+
+class Transfer extends ResourceController
+{
+    use ResponseTrait;
+
+    // all transfers
+    public function getAllTransfers()
+    {
+        $model = new \App\Models\StockTransfer();
+        $pageSize = $this->request->getVar('pageSize');
+        $pageIndex = $this->request->getVar('pageIndex');
+        $data = $model->getTransferWithTransferDetails($pageIndex, $pageSize);
+        return $this->respond($data);
+    }
+    public function getTransfersByShedAndDate()
+    {
+        $model = new \App\Models\StockTransfer();
+        $shedId = $this->request->getVar('fromShed');
+        $date = $this->request->getVar('transferDate');
+        $data = $model->getTransferDetailsByFromShedAndTransferDate($shedId, $date);
+        return $this->respond($data);
+    }
+
+    public function addUpdateTransfer()
+    {
+        $transferModel = new \App\Models\StockTransfer();
+        $stockModel = new \App\Models\Stock();
+        $mainEntryModel = new \App\Models\MainEntry();
+        $transferDetailsModel = new \App\Models\StockTransferDetail();
+        $userLog = new UserLog();
+
+        $fromShed = $this->request->getVar('fromShed');
+        if (empty($fromShed)) {
+            return $this->failForbidden("Please select from shed");
+        }
+        $fromLot = $this->request->getVar('fromLot');
+
+
+        $date = $this->request->getVar('date');
+        if (empty($date)) {
+            return $this->failForbidden("Please select from date");
+        }
+        $dateBs = $this->request->getVar('dateBs');
+
+        $transferDetails = $this->request->getVar('transferDetails');
+        if (empty($transferDetails)) {
+            return $this->failForbidden("Please fill transfer details");
+        }
+        $transferDataToCheck = $transferModel->where('fromShed', $fromShed)->where('transferDate', $date)->first();
+        // if(!empty($transferDataToCheck)) {
+        //     return $this->response->setStatusCode( "Cannot transfer ");
+        // }
+        $transferAge = $this->request->getVar('transferAge');
+        $totalMaleToBeTransfer = 0;
+        $totalFemaleToBeTransfer = 0;
+
+        //validation
+        $uqShed = array();
+        foreach ($transferDetails as $item) {
+
+            if (empty($item->toShed)) {
+                return $this->failForbidden("Please select shed to be transfered");
+            }
+            if ($item->toShed == $fromShed) {
+                return $this->failForbidden("Cannot transfer to same shed");
+            }
+
+            if (empty($item->male)) {
+                $male = 0;
+            } else {
+                $male = $item->male;
+            }
+            if (empty($item->female)) {
+                $female = 0;
+            } else {
+                $female = $item->female;
+            }
+            $totalMaleToBeTransfer += $male;
+            $totalFemaleToBeTransfer += $female;
+
+            if (in_array($item->toShed, $uqShed)) {
+                return $this->failForbidden("Cannot transfer to same shed");
+            }
+            array_push($uqShed, $item->toShed);
+        }
+
+        $stockData = $stockModel->where('shedId', $fromShed)->where('lot', $fromLot)->first();
+
+        if (empty($stockData)) {
+            return $this->failForbidden("Cannot transfer from this shed. Stock Not Found");
+        }
+
+
+        $transferDataToBeInserted = [
+            'fromShed' => $fromShed,
+            'fromLot' => $fromLot,
+            'transferAge' => $transferAge,
+            'transferDate' => $date,
+            'transferDateBs' => $dateBs,
+        ];
+
+        // this is for user log
+        $userLogData = [
+            'date' => time(),
+            'transferFrom' => $fromShed,
+        ];
+
+        if (empty($transferDataToCheck)) {
+            if ($totalMaleToBeTransfer > $stockData->male || $totalFemaleToBeTransfer > $stockData->female) {
+                return $this->failForbidden("Transfer number of male or female exceed stock");
+                //return $this->response->setStatusCode( "Transfer number of male or female exceed stock");
+            }
+            // return 'Error';
+            $id = $transferModel->insert($transferDataToBeInserted);
+
+            $mainEntryData = $mainEntryModel->getRecentlyAddedMainEntryByShedIdAndLot($fromShed, $fromLot);
+            if (!empty($mainEntryData)) {
+                $mainEntryStatus = [
+                    'status' => 1
+                ];
+                foreach ($mainEntryData as $item) {
+                    $mainEntryModel->update($item->id, $mainEntryStatus);
+                }
+            }
+
+            if ($totalMaleToBeTransfer == $stockData->male && $totalFemaleToBeTransfer == $stockData->female) {
+                $mainEntryData = $mainEntryModel->getRecentlyAddedOrActiveMainEntryByShedIdAndLot($fromShed, $fromLot);
+                if (!empty($mainEntryData)) {
+                    $mainEntryStatus = [
+                        'status' => 3
+                    ];
+                    foreach ($mainEntryData as $item) {
+                        $mainEntryModel->update($item->id, $mainEntryStatus);
+                    }
+                }
+            }
+
+            $userLogData['stockMale'] = $stockData->male;
+            $userLogData['stockFemale'] = $stockData->Female;
+
+            $stock = [
+                'male' => $stockData->male - $totalMaleToBeTransfer,
+                'female' => $stockData->female - $totalFemaleToBeTransfer
+            ];
+
+            $stockModel->update($stockData->id, $stock);
+            //$transferDetailsModel->delete(['stockTransferId' => $id]);
+            foreach ($transferDetails as $item) {
+                empty($item->toLot) ? $toLot = $fromLot : $toLot = $item->toLot;
+                $toShed = $item->toShed;
+                $stockDataForDetails = $stockModel->where('shedId', $toShed)->where('lot', $toLot)->first();
+
+                $toLotData = [
+                    'toShed' => $toShed,
+                    'toLot' => $toLot,
+                    'male' => $item->male,
+                    'female' => $item->female,
+                    'description' => $item->description,
+                    'stockTransferId' => $id
+                ];
+
+                $userLogData['transferTo'] = $toShed;
+                $userLogData['fromLot'] = $fromLot;
+                $userLogData['toLot'] = $toLot;
+                $userLogData['action'] = "transfer";
+                $userLogData['user'] = session()->get('username');
+
+                $userLog->insert($userLogData);
+
+
+                $transferDetailsModel->insert($toLotData);
+
+                if (!empty($stockDataForDetails)) {
+                    $stock = [
+                        'male' => $stockDataForDetails->male + $item->male,
+                        'female' => $stockDataForDetails->female + $item->female
+                    ];
+                    $stockModel->update($stockDataForDetails->id, $stock);
+                } else {
+                    $stock = [
+                        'shedId'  => $toShed,
+                        'lot' => $toLot,
+                        'male'  =>  $item->male,
+                        'entryDate' => $this->request->getVar('date'),
+                        'entryDateBs' => $this->request->getVar('dateBs'),
+                        'initialAge' => $this->request->getVar('transferAge'),
+                        'entryMale' => $item->male,
+                        'entryFemale' => $item->female,
+                        'entrySource' => 1,
+                        'breedTypeId' => $this->request->getVar('breedTypeId'),
+                        'female'  => $item->female,
+                    ];
+                    $stockModel->insert($stock);
+                }
+            }
+        } else {
+            $prevTransferDetailsMale = $transferDetailsModel->selectSum('male')->where('stockTransferId', $transferDataToCheck->id)->first();
+            $prevTransferDetailsFemale = $transferDetailsModel->selectSum('female')->where('stockTransferId', $transferDataToCheck->id)->first();
+
+            $prevTransferDetails = $transferDetailsModel->where('stockTransferId', $transferDataToCheck->id)->get()->getResult();
+            // $response = [
+            //     'status'   => 200,
+            //     'error'    => null,
+            //     'messages' => $prevTransferDetails[0]->female
+            // ];
+            // return $this->respond($response);
+
+            if ($totalMaleToBeTransfer > ($stockData->male + $prevTransferDetailsMale->male) || $totalFemaleToBeTransfer > ($stockData->female + $prevTransferDetailsFemale->female)) {
+                return $this->failForbidden("Transfer number of male or female exceed stock");
+            }
+            if ($totalMaleToBeTransfer != ($stockData->male + $prevTransferDetailsMale->male) && $totalFemaleToBeTransfer != ($stockData->female + $prevTransferDetailsFemale->female)) {
+                $mainEntryData = $mainEntryModel->getAllMainEntryByShedIdAndLot($fromShed, $fromLot);
+                if (!empty($mainEntryData)) {
+                    $mainEntryStatus = [
+                        'status' => 1
+                    ];
+                    foreach ($mainEntryData as $item) {
+                        $mainEntryModel->update($item->id, $mainEntryStatus);
+                    }
+                }
+            }
+            if ($totalMaleToBeTransfer == ($stockData->male + $prevTransferDetailsMale->male) && $totalFemaleToBeTransfer == ($stockData->female + $prevTransferDetailsFemale->female)) {
+                $mainEntryData = $mainEntryModel->getAllMainEntryByShedIdAndLot($fromShed, $fromLot);
+                if (!empty($mainEntryData)) {
+                    $mainEntryStatus = [
+                        'status' => 3
+                    ];
+                    foreach ($mainEntryData as $item) {
+                        $mainEntryModel->update($item->id, $mainEntryStatus);
+                    }
+                }
+            }
+            $stock = [
+                'male' => $stockData->male + $prevTransferDetailsMale->male - $totalMaleToBeTransfer,
+                'female' => $stockData->female + $prevTransferDetailsMale->female - $totalFemaleToBeTransfer
+            ];
+            $stockModel->update($stockData->id, $stock);
+
+            foreach ($prevTransferDetails as $i => $item) {
+                $prevItemStock = $stockModel->where('shedId', $item->toShed)->where('lot', $item->toLot)->first();
+                $stock = [
+                    'male' => $stockData->male - $prevItemStock->male,
+                    'female' => $stockData->female - $prevItemStock->female
+                ];
+                $stockModel->update($prevItemStock->id, $stock);
+            }
+
+            $transferDetailsModel->where('stockTransferId', $transferDataToCheck->id)->delete();
+
+            foreach ($transferDetails as $item) {
+                empty($item->toLot) ? $toLot = $fromLot : $toLot = $item->toLot;
+                $toShed = $item->toShed;
+                $stockDataForDetails = $stockModel->where('shedId', $toShed)->where('lot', $toLot)->first();
+
+                $toLotData = [
+                    'toShed' => $toShed,
+                    'toLot' => $toLot,
+                    'male' => $item->male,
+                    'female' => $item->female,
+                    'description' => $item->description,
+                    'stockTransferId' => $transferDataToCheck->id
+                ];
+                $transferDetailsModel->insert($toLotData);
+
+                if (!empty($stockDataForDetails)) {
+                    $stock = [
+                        'male' => $stockDataForDetails->male + $item->male,
+                        'female' => $stockDataForDetails->female + $item->female
+                    ];
+                    $stockModel->update($stockDataForDetails->id, $stock);
+                } else {
+                    $stock = [
+                        'shedId'  => $toShed,
+                        'lot' => $toLot,
+                        'male'  =>  $item->male,
+                        'entryDate' => $this->request->getVar('date'),
+                        'initialAge' => $this->request->getVar('transferAge'),
+                        'entryMale' => $item->male,
+                        'entryFemale' => $item->female,
+                        'entrySource' => 1,
+                        'breedTypeId' => $this->request->getVar('breedTypeId'),
+                        'female'  => $item->female,
+                    ];
+                    $stockModel->insert($stock);
+                }
+            }
+        }
+        $response = [
+            'status'   => 200,
+            'error'    => null,
+            'messages' => 'Transfer Added Successfully'
+        ];
+
+        return $this->respond($response);
+    }
+}
